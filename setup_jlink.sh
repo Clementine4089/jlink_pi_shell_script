@@ -5,12 +5,11 @@ USER="aruw"
 JLINK_DIR="JLink_Linux_${JLINK_VERSION}_arm"
 JLINK_TGZ="JLink_Linux_arm.tgz"
 JLINK_DOWNLOAD_URL="https://www.segger.com/downloads/jlink/JLink_Linux_${JLINK_VERSION}_arm.tgz"
-JLINK_EXEC="home/$user/$JLINK_DIR/JLinkRemoteServerCLExe"
+JLINK_EXEC="/home/$USER/$JLINK_DIR/JLinkRemoteServerCLExe"
 JLINK_SERVICE_FILE="/etc/systemd/system/jlink-remote-server.service"
 
 echo "Starting J-Link setup for Raspberry Pi..."
 
-# Check if the required 32-bit dynamic linker exists.
 if [ ! -f /lib/ld-linux-armhf.so.3 ]; then
     echo "32-bit dynamic linker /lib/ld-linux-armhf.so.3 not found."
     echo "Enabling armhf architecture and installing required 32-bit libraries..."
