@@ -1,6 +1,6 @@
 #!/bin/bash
 
-JLINK_VERSION="V646g"
+JLINK_VERSION="V812g"
 USER="aruw"
 JLINK_DIR="JLink_Linux_${JLINK_VERSION}_arm"
 JLINK_TGZ="JLink_Linux_arm.tgz"
@@ -11,6 +11,10 @@ JLINK_SERVICE_FILE="/etc/systemd/system/jlink-remote-server.service"
 echo "Starting J-Link setup for Raspberry Pi..."
 
 if [ ! -f /lib/ld-linux-armhf.so.3 ]; then
+    echo "WARNING: 32-bit dynamic linker not found!"
+    echo "This is required to run the J-Link Remote Server."
+    echo "Please ensure that the armhf architecture is enabled and the required 32-bit libraries are installed."
+    echo "Attempting automatic installation..."
     echo "32-bit dynamic linker /lib/ld-linux-armhf.so.3 not found."
     echo "Enabling armhf architecture and installing required 32-bit libraries..."
     sudo dpkg --add-architecture armhf
@@ -18,6 +22,9 @@ if [ ! -f /lib/ld-linux-armhf.so.3 ]; then
     sudo apt install -y libc6:armhf
     echo "Creating symlink for 32-bit dynamic linker..."
     sudo ln -s /lib/arm-linux-gnueabihf/ld-linux-armhf.so.3 /lib/ld-linux-armhf.so.3
+    echo "32-bit dynamic linker installation complete."
+    echo "JLink setup will now continue..."
+    echo "If issues persist, please ensure that the required 32-bit libraries are installed or install a 32-bit OS."
 fi
 
 echo "Downloading J-Link utilities..."
