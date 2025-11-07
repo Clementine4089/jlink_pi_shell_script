@@ -307,12 +307,8 @@ def start_owner_and_rtt():
                                     # First beat
                                     proc.stdin.write(b"Rasp Pi Heartbeat\n")
                                     proc.stdin.flush()
-                                    time.sleep(0.4)  # Short pause
+                                    time.sleep(0.5) 
                                     
-                                    # Second beat
-                                    proc.stdin.write(b"Rasp Pi Heartbeat\n")
-                                    proc.stdin.flush()
-                                    time.sleep(0.8)  # Longer pause before next cycle
                                 else:
                                     log("proc.stdin false")
                                     break
