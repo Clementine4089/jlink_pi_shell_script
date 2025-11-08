@@ -11,7 +11,6 @@ import time
 from datetime import datetime
 from queue import Empty, Queue
 
-# Config (env)
 RUN_AS_USER = os.environ.get("RUN_AS_USER", "aruw")
 JLINK_DIR = os.environ.get("JLINK_DIR", f"/home/{RUN_AS_USER}/JLink_Linux_V812g_arm")
 
@@ -20,49 +19,36 @@ IFACE = os.environ.get("JLINK_IFACE", "SWD")
 SPEED_KHZ = int(os.environ.get("JLINK_SPEED_KHZ", "4000"))
 
 RS_HOST = os.environ.get("JLINK_RS_HOST", "127.0.0.1")
-RS_PORT = int(os.environ.get("JLINK_RS_PORT", "19020"))  # J-Link Remote Server
-RTT_PORT = int(os.environ.get("JLINK_RTT_PORT", "19051"))  # Local RTT telnet port
+RS_PORT = int(os.environ.get("JLINK_RS_PORT", "19020"))
+RTT_PORT = int(os.environ.get("JLINK_RTT_PORT", "19051"))
 
-# Optional read-only RTT stream for local subscribers
 RTT_STREAM_ENABLED = os.environ.get("JLINK_RTT_STREAM_ENABLED", "1") == "1"
-# 'tcp' or 'udp' (tcp: multi-client read-only server; udp: datagrams sent to 127.0.0.1:RTT_STREAM_PORT)
-RTT_STREAM_PROTO = os.environ.get("JLINK_RTT_STREAM_PROTO", "tcp").lower()
 RTT_STREAM_PORT = int(os.environ.get("JLINK_RTT_STREAM_PORT", "19052"))
 
 SERVICE_NAME = os.environ.get("RS_SERVICE", "jlink-remote-server.service")
-START_RTT_CLIENT = os.environ.get("START_RTT_CLIENT", "1") == "1"  # 0 to disable
+START_RTT_CLIENT = os.environ.get("START_RTT_CLIENT", "1") == "1"
 
-# Self-attach grace window (seconds): ignore immediate "Client connected" events
 SELF_ATTACH_GRACE_S = float(os.environ.get("SELF_ATTACH_GRACE_S", "3.0"))
-
-# Debounce after "Waiting..." (seconds) before attempting attach
 WAITING_DEBOUNCE_S = float(os.environ.get("WAITING_DEBOUNCE_S", "1.0"))
 
 LOG_DIR = os.environ.get("JLINK_RTT_LOG_DIR", f"/home/{RUN_AS_USER}/jlink-rtt")
 os.makedirs(LOG_DIR, exist_ok=True)
-# Binaries
+
 JLINK_EXE = os.path.join(JLINK_DIR, "JLinkExe")
 JLINK_RTTCLIENT = os.path.join(JLINK_DIR, "JLinkRTTClient")
 
-# Journal patterns
 RE_WAITING = re.compile(r"Waiting for client connections\.\.\.", re.IGNORECASE)
 RE_CLIENT = re.compile(r"Client connected", re.IGNORECASE)
 
-# Globals
 procs_lock = threading.Lock()
 jlink_proc = None
 rttc_proc = None
 stop_flag = False
 
-# RTT stream subscribers (TCP sockets) or UDP sender socket
 subscribers_lock = threading.Lock()
-subscribers = []  # list of socket.socket objects (TCP)
-udp_sender = None
+subscribers = []
 
-# RTT log file used for forwarding
 rtt_log_file = None
-
-# Last local JLinkExe spawn timestamp (for grace checks)
 last_self_attach_ts = 0.0
 
 
@@ -107,22 +93,9 @@ def wait_tcp(host, port, timeout_s=5.0, interval=0.1):
 
 
 def start_rtt_stream_server():
-    """Start a background RTT stream acceptor or UDP sender."""
     if not RTT_STREAM_ENABLED:
         return
 
-    if RTT_STREAM_PROTO == "udp":
-        # UDP sender socket (no bind required for sending to localhost)
-        global udp_sender
-        try:
-            udp_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_sender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            log(f"RTT stream UDP sender prepared -> 127.0.0.1:{RTT_STREAM_PORT}")
-        except Exception as e:
-            log(f"RTT stream: failed to create UDP sender: {e}")
-        return
-
-    # TCP mode
     def _acceptor():
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -130,7 +103,7 @@ def start_rtt_stream_server():
             srv.bind(("0.0.0.0", RTT_STREAM_PORT))
             srv.listen(5)
             srv.settimeout(1.0)
-            log(f"RTT stream TCP listening on 0.0.0.0:{RTT_STREAM_PORT}")
+            log(f"RTT stream TCP on 0.0.0.0:{RTT_STREAM_PORT}")
             while not stop_flag:
                 try:
                     conn, addr = srv.accept()
@@ -142,78 +115,62 @@ def start_rtt_stream_server():
                 conn.setblocking(True)
                 with subscribers_lock:
                     subscribers.append(conn)
-                log(f"Subscriber connected from {addr}")
+                log(f"Subscriber from {addr}")
         except Exception as e:
-            log(f"RTT stream server error: {e}")
+            log(f"RTT stream error: {e}")
         finally:
             try:
                 srv.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"RTT stream close error: {e}")
 
     t = threading.Thread(target=_acceptor, daemon=True)
     t.start()
 
 
 def rtt_forwarder(proc, log_file):
-    """Read RTT client stdout, write to log, and forward to subscribers."""
-    global subscribers, udp_sender
+    global subscribers
     try:
         if proc.stdout is None:
             return
-        # Read and forward bytes
         while not stop_flag:
             try:
                 chunk = proc.stdout.read(1024)
                 if not chunk:
                     break
-                # Ensure bytes
                 if isinstance(chunk, str):
                     b = chunk.encode("utf-8", errors="replace")
                 else:
                     b = chunk
 
-                # Write to log
                 try:
                     log_file.write(
                         b if isinstance(b, str) else b.decode("utf-8", errors="replace")
                     )
                     log_file.flush()
                 except Exception:
-                    # ignore logging issues
                     pass
 
-                # Forward to subscribers
                 if RTT_STREAM_ENABLED:
-                    if RTT_STREAM_PROTO == "udp":
-                        try:
-                            if udp_sender:
-                                udp_sender.sendto(b, ("127.0.0.1", RTT_STREAM_PORT))
-                        except Exception:
-                            pass
-                    else:
-                        # TCP: send to all connected subscriber sockets
-                        with subscribers_lock:
-                            dead = []
-                            for s in list(subscribers):
+                    with subscribers_lock:
+                        dead = []
+                        for s in list(subscribers):
+                            try:
+                                s.sendall(b)
+                            except Exception:
                                 try:
-                                    s.sendall(b)
+                                    s.close()
                                 except Exception:
-                                    try:
-                                        s.close()
-                                    except Exception:
-                                        pass
-                                    dead.append(s)
-                            for d in dead:
-                                try:
-                                    subscribers.remove(d)
-                                except ValueError:
                                     pass
+                                dead.append(s)
+                        for d in dead:
+                            try:
+                                subscribers.remove(d)
+                            except ValueError:
+                                pass
             except Exception:
-                # back off a bit on unexpected read issues
                 time.sleep(0.05)
     finally:
-        # Close subscribers
         with subscribers_lock:
             for s in subscribers:
                 try:
@@ -221,19 +178,13 @@ def rtt_forwarder(proc, log_file):
                 except Exception:
                     pass
             subscribers = []
-        try:
-            if udp_sender:
-                udp_sender.close()
-        except Exception:
-            pass
 
 
 def start_owner_and_rtt():
-    """Start JLinkExe and optionally an RTT client."""
     global jlink_proc, rttc_proc, last_self_attach_ts
     with procs_lock:
         if process_is_alive(jlink_proc):
-            log("JLinkExe already running; not starting another.")
+            log("JLinkExe already running")
             return
 
         ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -246,23 +197,30 @@ def start_owner_and_rtt():
             f"-ip {RS_HOST}:{RS_PORT} "
             f"-RTTTelnetPort {RTT_PORT}"
         )
-        jlink_proc = popen(jcmd, stdout=jlink_log, stderr=subprocess.STDOUT)
+        jlink_proc = popen(
+            jcmd, stdout=jlink_log, stderr=subprocess.STDOUT, stdin=subprocess.PIPE
+        )
 
-        # Record launch time; immediate 'Client connected' may be local.
         last_self_attach_ts = time.time()
 
         time.sleep(0.6)
         if not process_is_alive(jlink_proc):
-            log("JLinkExe failed to start (likely because Ozone owns the probe).")
+            log("JLinkExe failed to start")
+            try:
+                jlink_log.close()
+                with open(jlink_log_path, "r") as f:
+                    err_output = f.read()
+                    if err_output.strip():
+                        log(f"JLinkExe output: {err_output[:500]}")
+            except Exception:
+                pass
             jlink_proc = None
             return
 
-        # Wait for RTT port
         if not wait_tcp("127.0.0.1", RTT_PORT, timeout_s=4.0):
-            log(f"RTT port {RTT_PORT} not listening yet; will not spawn RTT client.")
+            log(f"RTT port {RTT_PORT} not ready")
             return
 
-        # Kill stale RTT clients
         try:
             subprocess.run(
                 ["pkill", "-f", f"JLinkRTTClient.*RTTTelnetPort {RTT_PORT}"],
@@ -272,12 +230,10 @@ def start_owner_and_rtt():
             pass
 
         if START_RTT_CLIENT:
-            # Open RTT log and forward client stdout
             global rtt_log_file
             rtt_log_path = os.path.join(LOG_DIR, f"rtt_{ts}.log")
             rtt_log_file = open(rtt_log_path, "a")
             rcmd = f"{JLINK_RTTCLIENT} -RTTTelnetPort {RTT_PORT}"
-            # Capture stdout and open stdin so a heartbeat can be sent
             rttc_proc = popen(
                 rcmd,
                 stdout=subprocess.PIPE,
@@ -286,8 +242,7 @@ def start_owner_and_rtt():
             )
             time.sleep(0.3)
             if process_is_alive(rttc_proc):
-                log(f"RTT client attached on port {RTT_PORT}.")
-                # Start forwarder thread to relay RTT output
+                log(f"RTT client attached on port {RTT_PORT}")
                 try:
                     fwd = threading.Thread(
                         target=rtt_forwarder,
@@ -296,27 +251,21 @@ def start_owner_and_rtt():
                     )
                     fwd.start()
                 except Exception as e:
-                    log(f"Failed to start RTT forwarder thread: {e}")
+                    log(f"RTT forwarder thread error: {e}")
 
-                # Start heartbeat thread: send "1" every 0.5s while this process owns the RTT client
                 def _heartbeat(proc):
                     try:
                         while (not stop_flag) and process_is_alive(proc):
                             try:
                                 if proc.stdin:
-                                    # First beat
                                     proc.stdin.write(b"Rasp Pi Heartbeat\n")
                                     proc.stdin.flush()
-                                    time.sleep(0.5) 
-                                    
+                                    time.sleep(0.5)
                                 else:
-                                    log("proc.stdin false")
                                     break
                             except Exception as e:
-                                # stop heartbeat if writing fails
-                                log(f"Heartbeat Failure: {e}")
+                                log(f"Heartbeat error: {e}")
                                 break
-                            
                     finally:
                         try:
                             if proc.stdin:
@@ -330,20 +279,17 @@ def start_owner_and_rtt():
                     )
                     hb.start()
                 except Exception as e:
-                    log(f"Failed to start RTT heartbeat thread: {e}")
+                    log(f"Heartbeat thread error: {e}")
             else:
-                log("RTT client failed to start (port taken or other issue).")
+                log("RTT client failed to start")
         else:
             rttc_proc = None
-            log("START_RTT_CLIENT=0, not launching RTT client.")
 
 
 def stop_owner_and_rtt(reason):
-    """Stop JLinkExe and RTT client."""
     global jlink_proc, rttc_proc, rtt_log_file
     with procs_lock:
         if process_is_alive(rttc_proc):
-            # close stdin to help the client exit cleanly
             try:
                 if getattr(rttc_proc, "stdin", None):
                     try:
@@ -354,7 +300,6 @@ def stop_owner_and_rtt(reason):
                 pass
             kill_quiet(rttc_proc, "JLinkRTTClient")
         rttc_proc = None
-        # Close RTT log file if we opened one for forwarding
         if rtt_log_file is not None:
             try:
                 rtt_log_file.close()
@@ -364,15 +309,21 @@ def stop_owner_and_rtt(reason):
 
         if process_is_alive(jlink_proc):
             log(f"Stopping JLinkExe: {reason}")
+            try:
+                if getattr(jlink_proc, "stdin", None):
+                    try:
+                        jlink_proc.stdin.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             kill_quiet(jlink_proc, "JLinkExe")
         jlink_proc = None
 
 
 def journal_reader(service_name, out_queue):
-    """
-    Follow the journal for the Remote Server service and push lines to a queue.
-    """
-    # Prime recent lines
+    time.sleep(1.0)
+
     primed = subprocess.run(
         ["journalctl", "-u", service_name, "-n", "50", "-o", "cat"],
         stdout=subprocess.PIPE,
@@ -401,22 +352,25 @@ def journal_reader(service_name, out_queue):
 
 
 def state_machine():
-    """Reactions:
-    - 'Client connected' -> if within self-attach grace window, ignore; otherwise stop owner.
-    - 'Waiting for client connections...' -> after debounce, start owner+RTT if not running.
-    """
     global last_self_attach_ts
     q = Queue()
     t = threading.Thread(target=journal_reader, args=(SERVICE_NAME, q), daemon=True)
     t.start()
 
     last_waiting_ts = 0.0
+    snapshot_complete = False
+    last_snapshot_waiting = 0.0
 
     while not stop_flag:
         try:
             kind, line = q.get(timeout=0.5)
         except Empty:
-            # Debounced attach after 'Waiting...'
+            if not snapshot_complete:
+                snapshot_complete = True
+                if last_snapshot_waiting > 0:
+                    log("Snapshot shows probe available, attaching after debounce")
+                    last_waiting_ts = last_snapshot_waiting
+
             if (last_waiting_ts > 0) and (
                 (time.time() - last_waiting_ts) > WAITING_DEBOUNCE_S
             ):
@@ -425,34 +379,35 @@ def state_machine():
                 last_waiting_ts = 0.0
             continue
 
-        # Parse
         client_hit = bool(RE_CLIENT.search(line))
         waiting_hit = bool(RE_WAITING.search(line))
 
         if client_hit:
-            now = time.time()
-            # If JLinkExe was just spawned, this 'Client connected' is likely from the spawn; ignore it.
-            if (now - last_self_attach_ts) <= SELF_ATTACH_GRACE_S:
-                log(f"RemoteServer (grace): {line}")
-                # After the grace period, future client connections will stop the owner.
+            if not snapshot_complete:
+                log(f"RemoteServer (snapshot): {line}")
                 continue
 
-            # Otherwise an external client connected; stop the owner.
+            now = time.time()
+            if (now - last_self_attach_ts) <= SELF_ATTACH_GRACE_S:
+                log(f"RemoteServer (grace): {line}")
+                continue
+
             log(f"RemoteServer: {line}")
-            stop_owner_and_rtt("Remote Server shows 'Client connected' (not local)")
+            stop_owner_and_rtt("External client connected")
 
         elif waiting_hit:
             log(f"RemoteServer: {line}")
-            last_waiting_ts = (
-                time.time()
-            )  # after debounce, will call start_owner_and_rtt()
+            if not snapshot_complete:
+                last_snapshot_waiting = time.time()
+            else:
+                last_waiting_ts = time.time()
 
 
 def handle_signals():
     def _sig(signum, frame):
         global stop_flag
         stop_flag = True
-        log(f"Signal {signum} received; shutting down...")
+        log(f"Signal {signum} received, shutting down")
         stop_owner_and_rtt("shutdown")
         time.sleep(0.2)
         sys.exit(0)
@@ -467,7 +422,7 @@ def check_binaries():
             log(f"ERROR: Not executable: {path}")
             sys.exit(2)
     if not shutil_which("journalctl"):
-        log("ERROR: 'journalctl' not found in PATH.")
+        log("ERROR: journalctl not found")
         sys.exit(2)
 
 
@@ -482,13 +437,8 @@ def shutil_which(cmd):
 def main():
     handle_signals()
     check_binaries()
-    log(
-        f"Starting J-Link RTT supervisor "
-        f"(service='{SERVICE_NAME}', RS={RS_HOST}:{RS_PORT}, RTT={RTT_PORT}, "
-        f"SELF_ATTACH_GRACE_S={SELF_ATTACH_GRACE_S})"
-    )
-    log(f"Logs in: {LOG_DIR}")
-    # Start the RTT stream server/sender (if enabled). This runs in background.
+    log(f"J-Link RTT supervisor starting (RS={RS_HOST}:{RS_PORT}, RTT={RTT_PORT})")
+    log(f"Logs: {LOG_DIR}")
     start_rtt_stream_server()
     try:
         state_machine()
